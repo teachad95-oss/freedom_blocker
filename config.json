@@ -1,0 +1,19 @@
+{
+    "blocked_sites": [
+        "youtube.com"
+    ],
+    "blocked_apps": [
+        "notepad.exe"
+    ],
+    "schedules": [],
+    "locked_mode": false,
+    "active_until": null,
+    "blocked_keywords": [
+        "country=PH"
+    ],
+    "current_session": {
+        "start": "00:00",
+        "end": "23:59",
+        "locked": false
+    }
+}

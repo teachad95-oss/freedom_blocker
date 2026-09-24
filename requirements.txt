@@ -1,0 +1,9 @@
+pystray
+customtkinter
+psutil
+pywin32
+Pillow
+pyinstaller
+uiautomation
+comtypes
+
