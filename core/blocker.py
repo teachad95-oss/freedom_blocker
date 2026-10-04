@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import threading
 import psutil
 import logging
 import win32gui
@@ -13,6 +14,7 @@ try:
     HAS_UIAUTOMATION = True
 except ImportError:
     HAS_UIAUTOMATION = False
+
 
 
 # Set up logging
@@ -250,21 +252,27 @@ class AppBlocker:
 
 class KeywordBlocker:
     """
-    Monitors window titles and browser address bar URLs using Windows UI Automation,
-    closing windows containing blocked keywords or URL parameters (e.g. country=PH).
+    Monitors window titles and browser address bar URLs.
+    
+    Two-tier approach:
+      1. Fast title scan (< 1ms, runs every cycle in service loop via check_and_close)
+      2. Slow UIA URL scan (runs in background thread every 2s, never blocks main loop)
     """
     BROWSER_PROCESSES = {
-        "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", 
+        "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe",
         "opera.exe", "vivaldi.exe", "browser.exe"
     }
 
     def __init__(self, blocked_keywords=None):
         self.blocked_keywords = blocked_keywords if blocked_keywords else []
         self.is_blocking = False
+        self._uia_thread = None
+        self._uia_stop = threading.Event()
 
     def set_blocked_keywords(self, keywords):
         self.blocked_keywords = [k.lower().strip() for k in keywords if k.strip()]
 
+    # ── Process helper ─────────────────────────────────────────────────────────
     def _get_process_name(self, hwnd):
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -274,108 +282,115 @@ class KeywordBlocker:
             pass
         return ""
 
-    def _get_browser_url(self, hwnd, proc_name):
-        """Extracts current address bar URL/text from a browser window using UI Automation."""
+    # ── UIA address-bar extraction (slow, runs only in background thread) ──────
+    def _get_browser_url(self, hwnd):
         if not HAS_UIAUTOMATION:
             return ""
-
         try:
             ctrl = auto.ControlFromHandle(hwnd)
             if not ctrl:
                 return ""
-
-            # Locate address bar control across Chrome, Edge, Brave, Firefox, Opera, Vivaldi
-            edit = ctrl.EditControl(searchDepth=12, Name="Address and search bar")
-            if not edit.Exists(0, 0):
-                edit = ctrl.EditControl(searchDepth=12, Name="Address bar")
-            if not edit.Exists(0, 0):
-                edit = ctrl.EditControl(searchDepth=12, Name="Search or enter web address")
-            if not edit.Exists(0, 0):
-                edit = ctrl.EditControl(searchDepth=10)
-            if not edit.Exists(0, 0):
-                edit = ctrl.ComboBoxControl(searchDepth=10)
-
-            if edit and edit.Exists(0, 0):
-                # Pattern 1: LegacyIAccessiblePattern (Most reliable across Chromium & Firefox)
-                try:
-                    lp = edit.GetLegacyIAccessiblePattern()
-                    if lp and lp.Value:
-                        return lp.Value.lower()
-                except Exception:
-                    pass
-
-                # Pattern 2: GetValuePattern
-                try:
-                    vp = edit.GetValuePattern()
-                    if vp and vp.Value:
-                        return vp.Value.lower()
-                except Exception:
-                    pass
-
-                # Pattern 3: Name property fallback
-                if edit.Name:
-                    return edit.Name.lower()
+            # Try well-known address bar names first (fast), then generic EditControl
+            for name in ("Address and search bar", "Address bar",
+                         "Search or enter web address", ""):
+                edit = ctrl.EditControl(searchDepth=10, Name=name) if name else ctrl.EditControl(searchDepth=10)
+                if edit and edit.Exists(0, 0):
+                    try:
+                        lp = edit.GetLegacyIAccessiblePattern()
+                        if lp and lp.Value:
+                            return lp.Value.lower()
+                    except Exception:
+                        pass
+                    try:
+                        vp = edit.GetValuePattern()
+                        if vp and vp.Value:
+                            return vp.Value.lower()
+                    except Exception:
+                        pass
+                    if edit.Name:
+                        return edit.Name.lower()
+                    break   # found control but no text – stop searching
         except Exception as e:
-            logger.debug(f"UI Automation error reading browser window {hwnd}: {e}")
-
+            logger.debug(f"UIA error on hwnd {hwnd}: {e}")
         return ""
 
-
-    def _enum_window_callback(self, hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-
-        window_text = win32gui.GetWindowText(hwnd).lower()
-        if not window_text:
-            return
-
-        # 1. Fast window title check (Instant v15 speed - < 1ms)
-        for keyword in self.blocked_keywords:
-            if keyword in window_text:
-                logger.info(f"Closing window '{window_text}' due to keyword '{keyword}' in window title")
-                self._close_window(hwnd)
-                return
-
-    def _close_window(self, hwnd):
+    # ── Close helper ───────────────────────────────────────────────────────────
+    def _close_hwnd(self, hwnd):
         try:
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception as e:
             logger.error(f"Error closing window {hwnd}: {e}")
 
+    # ── FAST path: window-title scan (called every second by service loop) ─────
     def check_and_close(self):
-        """Enumerates windows and closes those with bad keywords or blocked URLs."""
+        """Fast title scan. Never calls UIA – always < 1ms."""
         if not self.blocked_keywords:
             return
 
-        # Step 1: Fast title enumeration across all visible windows (< 1ms)
-        try:
-            win32gui.EnumWindows(self._enum_window_callback, None)
-        except Exception as e:
-            logger.error(f"Error enumerating windows: {e}")
+        hwnds = []
 
-        # Step 2: Targeted URL bar check ONLY on active foreground browser window
+        def _cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                hwnds.append(hwnd)
+            return True         # keep enumerating
+
         try:
-            fg_hwnd = win32gui.GetForegroundWindow()
-            if fg_hwnd and win32gui.IsWindowVisible(fg_hwnd):
+            win32gui.EnumWindows(_cb, None)
+        except Exception as e:
+            logger.error(f"EnumWindows error: {e}")
+            return
+
+        for hwnd in hwnds:
+            title = win32gui.GetWindowText(hwnd).lower()
+            if not title:
+                continue
+            for kw in self.blocked_keywords:
+                if kw in title:
+                    logger.info(f"[TITLE] Closing '{title}' – keyword '{kw}'")
+                    self._close_hwnd(hwnd)
+                    break
+
+    # ── SLOW path: UIA URL scan (runs in its own thread every 2 seconds) ──────
+    def _uia_loop(self):
+        """Background thread: checks foreground browser URL every 2 s."""
+        while not self._uia_stop.wait(2.0):   # sleep 2 s between checks
+            if not self.blocked_keywords:
+                continue
+            try:
+                fg_hwnd = win32gui.GetForegroundWindow()
+                if not fg_hwnd or not win32gui.IsWindowVisible(fg_hwnd):
+                    continue
                 proc_name = self._get_process_name(fg_hwnd)
-                if proc_name in self.BROWSER_PROCESSES:
-                    url_text = self._get_browser_url(fg_hwnd, proc_name)
-                    if url_text:
-                        for keyword in self.blocked_keywords:
-                            if keyword in url_text:
-                                title = win32gui.GetWindowText(fg_hwnd)
-                                logger.info(f"Closing active browser [{proc_name}] window '{title}' due to URL parameter keyword '{keyword}' in address bar: '{url_text}'")
-                                self._close_window(fg_hwnd)
-                                break
-        except Exception as e:
-            logger.debug(f"Error checking foreground browser window: {e}")
+                if proc_name not in self.BROWSER_PROCESSES:
+                    continue
+                url = self._get_browser_url(fg_hwnd)
+                if not url:
+                    continue
+                for kw in self.blocked_keywords:
+                    if kw in url:
+                        title = win32gui.GetWindowText(fg_hwnd)
+                        logger.info(f"[URL] Closing [{proc_name}] '{title}' – keyword '{kw}' in '{url}'")
+                        self._close_hwnd(fg_hwnd)
+                        break
+            except Exception as e:
+                logger.debug(f"UIA loop error: {e}")
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
     def start_blocking(self):
         self.is_blocking = True
-        logger.info("Keyword & URL blocking started.")
+        self._uia_stop.clear()
+        if HAS_UIAUTOMATION:
+            self._uia_thread = threading.Thread(target=self._uia_loop, daemon=True, name="UIA-URL-Checker")
+            self._uia_thread.start()
+            logger.info("Keyword & URL blocking started (UIA thread running).")
+        else:
+            logger.info("Keyword blocking started (UIA not available – title-only).")
 
     def stop_blocking(self):
         self.is_blocking = False
+        self._uia_stop.set()
+        if self._uia_thread and self._uia_thread.is_alive():
+            self._uia_thread.join(timeout=3.0)
+        self._uia_thread = None
         logger.info("Keyword & URL blocking stopped.")
-
 

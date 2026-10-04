@@ -178,22 +178,38 @@ def ensure_autostart_powershell():
     $Arg = '{action_args}'
 
     $Action = New-ScheduledTaskAction -Execute $ExePath -Argument $Arg
-    
-    # Trigger 1: At Logon
+
+    # Trigger 1: At Logon (fires when user logs in)
     $TrigLogon = New-ScheduledTaskTrigger -AtLogon
-    
-    # Trigger 2: At Startup (for robustness) - optional/skip
-    
-    # Settings: Hidden, RunLevel Highest, IgnoreNew execution
-    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
-    
-    # Register
-    # Note: We need to use -Force
-    # We want repetition. It's easier to modify the trigger object after creation or use raw XML, but Let's try advanced properties.
-    $TrigLogon.Repetition.Interval = "PT1M"
-    $TrigLogon.Repetition.Duration = "P1D" # Re-triggers every logon anyway
-    
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $TrigLogon -Settings $Settings -RunLevel Highest -User $env:USERNAME -Force
+
+    # Trigger 2: Repeating calendar trigger (PT1M every minute, all day like Freedom)
+    # This ensures auto-restart if the process is killed
+    $TrigRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date -Hour 0 -Minute 0 -Second 0)
+    $TrigRepeat.Repetition.Interval = "PT1M"
+    $TrigRepeat.Repetition.Duration = "P1D"
+    $TrigRepeat.Repetition.StopAtDurationEnd = $false
+
+    # Settings: Hidden, run highest privilege, ignore if already running
+    $Settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -Hidden `
+        -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+        -MultipleInstances IgnoreNew `
+        -StartWhenAvailable
+
+    # Unregister old task first to ensure clean state
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Register with both triggers
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $Action `
+        -Trigger @($TrigLogon, $TrigRepeat) `
+        -Settings $Settings `
+        -RunLevel Highest `
+        -User $env:USERNAME `
+        -Force
     """
     
     ps_file = os.path.join(os.path.dirname(log_path), "register_task.ps1")
