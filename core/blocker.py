@@ -290,26 +290,43 @@ class KeywordBlocker:
             ctrl = auto.ControlFromHandle(hwnd)
             if not ctrl:
                 return ""
-            # Try well-known address bar names first (fast), then generic EditControl
-            for name in ("Address and search bar", "Address bar",
-                         "Search or enter web address", ""):
-                edit = ctrl.EditControl(searchDepth=10, Name=name) if name else ctrl.EditControl(searchDepth=10)
-                if edit and edit.Exists(0, 0):
+
+            # Search strategies in priority order:
+            # Named searches first (fast & precise), then class-name (Chrome omnibox),
+            # then generic EditControl fallback.
+            search_configs = [
+                {"Name": "Address and search bar", "searchDepth": 12},  # Brave, Chrome, Edge
+                {"Name": "Address bar",             "searchDepth": 12},  # Older Edge
+                {"Name": "Search or enter web address", "searchDepth": 12},  # Firefox
+                {"ClassName": "OmniboxViewViews",   "searchDepth": 15},  # Chrome (class-name)
+                {"searchDepth": 12},                                       # Generic fallback
+            ]
+
+            for cfg in search_configs:
+                try:
+                    edit = ctrl.EditControl(**cfg)
+                    if not (edit and edit.Exists(0, 0)):
+                        continue
+                    # Pattern 1: LegacyIAccessible (most reliable across Chromium & Firefox)
                     try:
                         lp = edit.GetLegacyIAccessiblePattern()
                         if lp and lp.Value:
                             return lp.Value.lower()
                     except Exception:
                         pass
+                    # Pattern 2: ValuePattern
                     try:
                         vp = edit.GetValuePattern()
                         if vp and vp.Value:
                             return vp.Value.lower()
                     except Exception:
                         pass
+                    # Pattern 3: Name attribute fallback
                     if edit.Name:
                         return edit.Name.lower()
-                    break   # found control but no text – stop searching
+                except Exception:
+                    continue
+
         except Exception as e:
             logger.debug(f"UIA error on hwnd {hwnd}: {e}")
         return ""
@@ -352,28 +369,49 @@ class KeywordBlocker:
 
     # ── SLOW path: UIA URL scan (runs in its own thread every 2 seconds) ──────
     def _uia_loop(self):
-        """Background thread: checks foreground browser URL every 2 s."""
-        while not self._uia_stop.wait(2.0):   # sleep 2 s between checks
-            if not self.blocked_keywords:
-                continue
+        """Background thread: checks foreground browser URL every 2 s.
+
+        KEY FIX (v17): COM (comtypes) is initialised ONCE at thread start and
+        uninitialised when the thread exits.  Previously, uiautomation called
+        comtypes.CoInitializeEx() inside every ControlFromHandle() call without
+        a matching CoUninitialize(), leaking one COM-STA proxy thread per call.
+        Running every 2 s for hours produced thousands of zombie threads and
+        gigabytes of RAM.  Initialising here once prevents that entirely.
+        """
+        try:
+            import comtypes
+            comtypes.CoInitializeEx()          # COM init — once for the whole thread lifetime
+        except Exception as e:
+            logger.debug(f"COM CoInitializeEx error: {e}")
+
+        try:
+            while not self._uia_stop.wait(2.0):   # 2-second check interval (unchanged)
+                if not self.blocked_keywords:
+                    continue
+                try:
+                    fg_hwnd = win32gui.GetForegroundWindow()
+                    if not fg_hwnd or not win32gui.IsWindowVisible(fg_hwnd):
+                        continue
+                    proc_name = self._get_process_name(fg_hwnd)
+                    if proc_name not in self.BROWSER_PROCESSES:
+                        continue
+                    url = self._get_browser_url(fg_hwnd)
+                    if not url:
+                        continue
+                    for kw in self.blocked_keywords:
+                        if kw in url:
+                            title = win32gui.GetWindowText(fg_hwnd)
+                            logger.info(f"[URL] Closing [{proc_name}] '{title}' – keyword '{kw}' in '{url}'")
+                            self._close_hwnd(fg_hwnd)
+                            break
+                except Exception as e:
+                    logger.debug(f"UIA loop error: {e}")
+        finally:
             try:
-                fg_hwnd = win32gui.GetForegroundWindow()
-                if not fg_hwnd or not win32gui.IsWindowVisible(fg_hwnd):
-                    continue
-                proc_name = self._get_process_name(fg_hwnd)
-                if proc_name not in self.BROWSER_PROCESSES:
-                    continue
-                url = self._get_browser_url(fg_hwnd)
-                if not url:
-                    continue
-                for kw in self.blocked_keywords:
-                    if kw in url:
-                        title = win32gui.GetWindowText(fg_hwnd)
-                        logger.info(f"[URL] Closing [{proc_name}] '{title}' – keyword '{kw}' in '{url}'")
-                        self._close_hwnd(fg_hwnd)
-                        break
-            except Exception as e:
-                logger.debug(f"UIA loop error: {e}")
+                import comtypes
+                comtypes.CoUninitialize()      # Always clean up COM on thread exit
+            except Exception:
+                pass
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
     def start_blocking(self):
